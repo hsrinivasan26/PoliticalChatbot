@@ -2,10 +2,10 @@
 import re
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from config import OPENAI_API_KEY, OPENAI_MODEL
 from prompts import CONTEXT_SUMMARY_SYSTEM_PROMPT, RELEVANCE_CHECK_SYSTEM_PROMPT, RESEARCH_INQUIRY_SYSTEM_PROMPT, CORE_CHAT_PROMPT
-from research import Claim, research_output
+from research import research_output
 llm = ChatOpenAI(
     model=OPENAI_MODEL,
     api_key=OPENAI_API_KEY,
@@ -19,11 +19,12 @@ llm = ChatOpenAI(
 #We can only summarize so far. Every 5 summaries (50,000 characters), we just drop the oldest 20% of the context
 context = []
 summary_count = 0
+CONTEXT_CHAR_LIMIT = 10000
 _NUMBERED_LINE_RE = re.compile(r"^\d+\.\s*")
 
 def trim_context(context):
     global summary_count
-    if sum(len(c) for c in context) < 10000:
+    if sum(len(c) for c in context) < CONTEXT_CHAR_LIMIT:
         return context
     elif summary_count < 5:
         numbered_entries = "\n".join(f"{i + 1}. {entry}" for i, entry in enumerate(context))
@@ -51,12 +52,11 @@ def trim_context(context):
 #Rejection messages aren't sent through the research pipeline, saving on latency
 #When messages are processed, they are sent to the research planner, which decides what needs to be researched before responding
 #3 categories of research: factual claim, perspective pairs, and constitutional claims.
-#When no perspective is specified we generalize to all perspectives to ensure a balanced view. Consitutional claims are sent to a RAG
-violation_count = 0
+#When no perspective is specified we generalize to all perspectives to ensure a balanced view. Constitutional claims are sent to a RAG
 accepting_chats = True
 VIOLATION_LIMIT = 10
 
-class RelevanceScore(BaseModel):
+class RelevanceScore(BaseModel): #output schema that enforces strucutre for relevance judge
     politics_relevance: int = Field(ge=1, le=5, description="How pertinent the message is to politics, 1-5.")
     safe_language: int = Field(ge=1, le=5, description="How free of vulgar/inappropriate language the message is, 1-5.")
 
@@ -79,11 +79,11 @@ def check_relevance(txt, recent_context):
 def guardrail(txt):
     global violation_count, accepting_chats
     scores = check_relevance(txt, context[-4:])
-    if scores is None:
+    if scores is None: #means some API didn't respond, so later chats aren't going to work
         return "API Error: please try again."
     if scores[0] < 3 or scores[1] < 3:
         violation_count += 1
-        if violation_count >= VIOLATION_LIMIT:
+        if violation_count >= VIOLATION_LIMIT: #we accept 10 off topic or inappropriate messages then shut down
             accepting_chats = False
             return "This chat is either too inappropriate or off-topic, and has ended."
         if scores[0] < 3 and scores[1] < 3:
@@ -95,14 +95,14 @@ def guardrail(txt):
     else:
         return None
 
-def collect_chat(txt):
+def collect_chat(txt): #if we dont screen a chat out we respond to it
     prescreened = guardrail(txt)
     if prescreened is not None:
         return prescreened
     return chat_respond(txt)
 
 
-class _PerspectivePair(BaseModel):
+class _PerspectivePair(BaseModel): #schema for perspective inquiries, which have both an issue and a person/entity
     inquiry: str = Field(description="The perspective query.")
     entity: str = Field(description="The person/group whose perspective is sought.")
 
@@ -111,8 +111,8 @@ class _ResearchInquirySchema(BaseModel):
     perspective_inquiries: list[_PerspectivePair] = Field(default_factory=list, description="Perspective queries, each paired with the person/group whose perspective is sought.")
     constitutional_inquiries: list[str] = Field(default_factory=list, description="Concise queries about constitutional text or meaning.")
 
-class ResearchInquiry(BaseModel):
-    factual_inquiries: list[str] = Field(default_factory=list)
+class ResearchInquiry(BaseModel): #similar to Claims, we want perspective pairs as tuples, but OpenAI's structured output rejects tuple fields. So, we use the schema in the
+    factual_inquiries: list[str] = Field(default_factory=list) #builder class and convert to string tuples in the actual version
     perspective_inquiries: list[tuple[str, str]] = Field(default_factory=list)
     constitutional_inquiries: list[str] = Field(default_factory=list)
 
@@ -132,14 +132,14 @@ class ChatResponse(BaseModel):
 
 chat_responder = llm.with_structured_output(ChatResponse)
 
-def _format_claims(claims):
+def _format_claims(claims): #formats claim objects to be sent to the model for final processing. Model can read strings not claim objects
     lines = []
     for c in claims:
         evidence_str = "; ".join(f'"{quote}" ({source})' for quote, source in c.evidence)
         lines.append(f"- Proposition: {c.proposition}\n  Evidence: {evidence_str}\n  Reasoning: {c.reasoning}")
     return "\n".join(lines)
 
-def _format_sources(sources):
+def _format_sources(sources): #same purpose as above
     grouped = {}
     order = []
     for s in sources:
@@ -150,8 +150,10 @@ def _format_sources(sources):
     lines = [f"({c}) " + "; ".join(grouped[c]) for c in order]
     return "\n".join(lines)
 
-def chat_respond(txt):
-    global context
+last_reasoning = None
+
+def chat_respond(txt): #sources info, structures into response
+    global context, last_reasoning
     context = trim_context(context)
     context_block = "\n".join(context)
 
@@ -173,6 +175,7 @@ def chat_respond(txt):
         HumanMessage(content=f"Conversation so far:\n{context_block}\n\nResearched claims:\n{claims_block}\n\nUser message: {txt}"),
     ])
 
+    last_reasoning = response.reasoning
     answer = response.answer
     sources_block = _format_sources(response.sources)
     if sources_block:
@@ -182,5 +185,12 @@ def chat_respond(txt):
     context.append(f"AI: {answer}")
 
     return answer
+
+def set_model(model_name):
+    global llm, relevance_judge, research_planner, chat_responder
+    llm = ChatOpenAI(model=model_name, api_key=OPENAI_API_KEY)
+    relevance_judge = llm.with_structured_output(RelevanceScore)
+    research_planner = llm.with_structured_output(_ResearchInquirySchema)
+    chat_responder = llm.with_structured_output(ChatResponse)
 
 
