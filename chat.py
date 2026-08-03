@@ -5,7 +5,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from config import OPENAI_API_KEY, OPENAI_MODEL
 from prompts import CONTEXT_SUMMARY_SYSTEM_PROMPT, RELEVANCE_CHECK_SYSTEM_PROMPT, RESEARCH_INQUIRY_SYSTEM_PROMPT, CORE_CHAT_PROMPT
-from research import research_output
+from research import research_output, FALLBACK_TEXT
 llm = ChatOpenAI(
     model=OPENAI_MODEL,
     api_key=OPENAI_API_KEY,
@@ -20,7 +20,7 @@ llm = ChatOpenAI(
 context = []
 summary_count = 0
 CONTEXT_CHAR_LIMIT = 10000
-_NUMBERED_LINE_RE = re.compile(r"^\d+\.\s*")
+NUMBERED_LINE_RE = re.compile(r"^\d+\.\s*")
 
 def trim_context(context):
     global summary_count
@@ -33,7 +33,7 @@ def trim_context(context):
             HumanMessage(content=numbered_entries),
         ])
         shortened = [
-            _NUMBERED_LINE_RE.sub("", line).strip()
+            NUMBERED_LINE_RE.sub("", line).strip()
             for line in response.content.splitlines()
             if line.strip()
         ]
@@ -55,6 +55,7 @@ def trim_context(context):
 #When no perspective is specified we generalize to all perspectives to ensure a balanced view. Constitutional claims are sent to a RAG
 accepting_chats = True
 VIOLATION_LIMIT = 10
+violation_count = 0
 
 class RelevanceScore(BaseModel): #output schema that enforces strucutre for relevance judge
     politics_relevance: int = Field(ge=1, le=5, description="How pertinent the message is to politics, 1-5.")
@@ -78,18 +79,20 @@ def check_relevance(txt, recent_context):
 
 def guardrail(txt):
     global violation_count, accepting_chats
+    if not accepting_chats:
+        return "This chat is either too inappropriate or off-topic, and has ended."
     scores = check_relevance(txt, context[-4:])
     if scores is None: #means some API didn't respond, so later chats aren't going to work
         return "API Error: please try again."
     if scores[0] < 3 or scores[1] < 3:
         violation_count += 1
-        if violation_count >= VIOLATION_LIMIT: #we accept 10 off topic or inappropriate messages then shut down
+        if violation_count >= VIOLATION_LIMIT: #we accept 10 off topic or inappropriate messages (chance at redemption) then shut down
             accepting_chats = False
             return "This chat is either too inappropriate or off-topic, and has ended."
         if scores[0] < 3 and scores[1] < 3:
             return "This chat is meant to be political and respectful. Please try again."
         elif scores[0] < 3:
-            return "This chat is meant to focus on politics. Please try again."
+            return "This chat is meant to focus on political discussion. I can chat about politics, but I can't help with productivity tasks or off-topic discussions. Please try again."
         else:
             return "This chat is meant to be respectful and appropriate. Please try again."
     else:
@@ -102,13 +105,13 @@ def collect_chat(txt): #if we dont screen a chat out we respond to it
     return chat_respond(txt)
 
 
-class _PerspectivePair(BaseModel): #schema for perspective inquiries, which have both an issue and a person/entity
+class PerspectivePair(BaseModel): #schema for perspective inquiries, which have both an issue and a person/entity
     inquiry: str = Field(description="The perspective query.")
     entity: str = Field(description="The person/group whose perspective is sought.")
 
-class _ResearchInquirySchema(BaseModel):
+class ResearchInquirySchema(BaseModel):
     factual_inquiries: list[str] = Field(default_factory=list, description="Concise, search-engine-ready factual queries.")
-    perspective_inquiries: list[_PerspectivePair] = Field(default_factory=list, description="Perspective queries, each paired with the person/group whose perspective is sought.")
+    perspective_inquiries: list[PerspectivePair] = Field(default_factory=list, description="Perspective queries, each paired with the person/group whose perspective is sought.")
     constitutional_inquiries: list[str] = Field(default_factory=list, description="Concise queries about constitutional text or meaning.")
 
 class ResearchInquiry(BaseModel): #similar to Claims, we want perspective pairs as tuples, but OpenAI's structured output rejects tuple fields. So, we use the schema in the
@@ -119,27 +122,27 @@ class ResearchInquiry(BaseModel): #similar to Claims, we want perspective pairs 
     def is_empty(self):
         return not (self.factual_inquiries or self.perspective_inquiries or self.constitutional_inquiries)
 
-research_planner = llm.with_structured_output(_ResearchInquirySchema)
+research_planner = llm.with_structured_output(ResearchInquirySchema)
 
-class _SourceEntry(BaseModel):
+class SourceEntry(BaseModel):
     citation: str = Field(description="The citation marker used in the answer, e.g. '1'.")
     url: str = Field(description="The source URL for this citation.")
 
 class ChatResponse(BaseModel):
     reasoning: str = Field(description="Internal step-by-step reasoning, not shown to the user.")
     answer: str = Field(description="The final user-facing response.")
-    sources: list[_SourceEntry] = Field(default_factory=list, description="Citation markers used in the answer, paired with their source URLs.")
+    sources: list[SourceEntry] = Field(default_factory=list, description="Citation markers used in the answer, paired with their source URLs.")
 
 chat_responder = llm.with_structured_output(ChatResponse)
 
-def _format_claims(claims): #formats claim objects to be sent to the model for final processing. Model can read strings not claim objects
+def format_claims(claims): #formats claim objects to be sent to the model for final processing. Model can read strings not claim objects
     lines = []
     for c in claims:
         evidence_str = "; ".join(f'"{quote}" ({source})' for quote, source in c.evidence)
         lines.append(f"- Proposition: {c.proposition}\n  Evidence: {evidence_str}\n  Reasoning: {c.reasoning}")
     return "\n".join(lines)
 
-def _format_sources(sources): #same purpose as above
+def format_sources(sources): #same purpose as above
     grouped = {}
     order = []
     for s in sources:
@@ -168,16 +171,25 @@ def chat_respond(txt): #sources info, structures into response
     )
 
     claims = [] if inquiry.is_empty() else research_output(inquiry)
-    claims_block = _format_claims(claims)
+    failed_urls = [url for c in claims if c.proposition == FALLBACK_TEXT for _, url in c.evidence]
+    claims = [c for c in claims if c.proposition != FALLBACK_TEXT]
+    claims_block = format_claims(claims)
 
     response = chat_responder.invoke([
         SystemMessage(content=CORE_CHAT_PROMPT),
         HumanMessage(content=f"Conversation so far:\n{context_block}\n\nResearched claims:\n{claims_block}\n\nUser message: {txt}"),
     ])
 
-    last_reasoning = response.reasoning
+    last_reasoning = (
+        "The research pipeline triggered OpenAI's copyright filters. To read more, refer to the sources section"
+        if failed_urls else response.reasoning
+    )
     answer = response.answer
-    sources_block = _format_sources(response.sources)
+    sources_block = format_sources(response.sources)
+    if failed_urls: #sources that failed quote-extraction still get listed, just without a quoted citation tying them to the answer text
+        next_marker = len({s.citation for s in response.sources}) + 1
+        extra_lines = "\n".join(f"({next_marker + i}) {url}" for i, url in enumerate(failed_urls))
+        sources_block = f"{sources_block}\n{extra_lines}" if sources_block else extra_lines
     if sources_block:
         answer = f"{answer}\n\nSources:\n{sources_block}"
 
@@ -190,7 +202,7 @@ def set_model(model_name):
     global llm, relevance_judge, research_planner, chat_responder
     llm = ChatOpenAI(model=model_name, api_key=OPENAI_API_KEY)
     relevance_judge = llm.with_structured_output(RelevanceScore)
-    research_planner = llm.with_structured_output(_ResearchInquirySchema)
+    research_planner = llm.with_structured_output(ResearchInquirySchema)
     chat_responder = llm.with_structured_output(ChatResponse)
 
 

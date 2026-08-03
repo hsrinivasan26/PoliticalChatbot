@@ -15,12 +15,12 @@ from config import OPENAI_API_KEY
 #Then they proceed with (possibly a space) and a string of roman numerals; hence the [IVXLCDM] character class
 PAGE_HEADER = "C O N S T I T U T I O N O F T H E U N I T E D S T A T E S"
 HEADER_RE = re.compile(r"(Article\.\s+(?:[IVXLCDM]\s?)+\.|Amendment\s+(?:[IVXLCDM]\s?)+\.)")
-SUBSECTION_RE = re.compile(r"SECTION\.?\s+(\d+)\s*\.?")
+SUBSECTION_RE = re.compile(r"SECTION\.?\s+(\d+)\s*\.?") #used for chunking
 INDEX_PATH = "constitution_index"
 
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
 
-#gets rid of spaces between the roman numerals in the header
+#gets rid of spaces/dots between the roman numerals in the header
 def normalize_header(header):
     return re.sub(r"(?<=[IVXLCDM])\s+(?=[IVXLCDM])", "", header)
 
@@ -37,15 +37,16 @@ def load_text():
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
+#RAG chunking. We need atomicity in the RAG breakdown so that vector similarity actually matches the sections with queries
+#A lot of constitutional clauses talk about a lot of different things at the same time so they score poorly on relevance
 def split_into_subsections(header, body):
-    matches = list(SUBSECTION_RE.finditer(body))
+    matches = list(SUBSECTION_RE.finditer(body)) #break down clause into subsections
     if not matches:
-        return {clean_header(header): body}
+        return {clean_header(header): body} #if there are no subsections we are forced to return the clause
 
     subsections = {}
     intro = body[:matches[0].start()].strip()
-    for i, m in enumerate(matches):
+    for i, m in enumerate(matches): #compile subsections into a dict
         end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
         section_text = body[m.start():end].strip()
         if i == 0 and intro:
@@ -67,7 +68,7 @@ def extract_sections(text):
     return sections
 
 
-def build_index(): #store sections under their header name
+def build_index(): #store sections under their header name (section key)
     sections = extract_sections(load_text())
     texts = list(sections.values())
     metadatas = [{"reference": header} for header in sections.keys()]

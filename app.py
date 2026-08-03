@@ -29,7 +29,7 @@ def respond(message, history, selected_model, context_limit):
         research.set_model(selected_model)
     chat.CONTEXT_CHAR_LIMIT = int(context_limit)
 
-    yield "🤔 Thinking..."
+    yield "Thinking..."
 
     prescreened = chat.guardrail(message)
     if prescreened is not None:
