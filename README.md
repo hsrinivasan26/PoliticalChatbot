@@ -1,3 +1,5 @@
+Documentation, product requirements table, and setup instructions in documenation.md.
+
 Political chatbot intended to engage in meaningful discussion on political and legal subjects. Each user input is categorized by an LLM-as-judge classifier into one of 3 categories:
 
 - Conversational transition ("Oh, ok.", "I understand.", etc.) -> routed directly to model.
